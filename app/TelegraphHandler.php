@@ -17,6 +17,9 @@ use Illuminate\Support\Facades\Storage;
 use DefStudio\Telegraph\DTO\Message;
 use Illuminate\Http\Request;
 use Throwable;
+use App\Models\PendingJoinRequest;
+use App\Jobs\DeclinePendingJoinRequest;
+use Carbon\Carbon;
 
 class TelegraphHandler extends WebhookHandler
 {
@@ -87,9 +90,11 @@ class TelegraphHandler extends WebhookHandler
 
         $r = $payload['chat_join_request'];
         $userChatId = $r['user_chat_id'] ?? null;    // ЛС пользователю
+        $userId = $r['from']['id'] ?? null;
+        $chatId = $r['chat']['id'] ?? null;
         $name = trim(($r['from']['first_name'] ?? '') . ' ' . ($r['from']['last_name'] ?? ''));
 
-        if ($userChatId) {
+        if ($userChatId && $userId && $chatId) {
             // Пишем в ЛС правила и даём кнопку "Вступить"
             $text = "Привет, {$name}!\n" .
                 "Перед входом — короткие правила:\n" .
@@ -103,7 +108,7 @@ class TelegraphHandler extends WebhookHandler
                 "• В случае возникновение ошибок с ботом - @wtfnonamedw\n" .
                 "\nНажми кнопку ниже, чтобы войти.";
 
-            $this->telegramRequest('sendMessage', [
+            $messageResult = $this->telegramRequest('sendMessage', [
                 'chat_id' => $userChatId,
                 'text' => $text,
                 'parse_mode' => 'HTML',
@@ -113,6 +118,21 @@ class TelegraphHandler extends WebhookHandler
                     ]
                 ], JSON_UNESCAPED_UNICODE),
             ]);
+
+            $messageId = $messageResult['result']['message_id'] ?? null;
+
+            // Сохраняем заявку в базу данных
+            $pendingRequest = PendingJoinRequest::create([
+                'user_id' => $userId,
+                'chat_id' => $chatId,
+                'message_id' => $messageId,
+                'expires_at' => Carbon::now()->addMinutes(5), // 5 минут на ответ
+                'processed' => false,
+            ]);
+
+            // Запускаем Job для автоматического отклонения через 5 минут
+            DeclinePendingJoinRequest::dispatch($pendingRequest->id)
+                ->delay(now()->addMinutes(5));
         }
     }
 
@@ -123,9 +143,33 @@ class TelegraphHandler extends WebhookHandler
 
     public function inviteForum()
     {
+        $userId = $this->callbackQuery->from()->id();
+        $chatId = '-1002013150763';
+
+        // Находим заявку (включая обработанные, чтобы проверить срок)
+        $pendingRequest = PendingJoinRequest::where('user_id', $userId)
+            ->orderBy('created_at', 'desc')
+            ->first();
+
+        // Проверяем, истекла ли заявка или была ли она уже обработана
+        if (!$pendingRequest || $pendingRequest->processed || $pendingRequest->expires_at < now()) {
+            $this->reply('❌ Время действия заявки истекло. Пожалуйста, отправьте заявку на вступление заново.');
+            
+            if ($this->callbackQuery->message()) {
+                $this->chat->deleteMessage($this->callbackQuery->message()->id())->send();
+            }
+            
+            return;
+        }
+
+        // Помечаем заявку как обработанную
+        $pendingRequest->update(['processed' => true]);
+        // Используем chat_id из заявки, если он есть
+        $chatId = $pendingRequest->chat_id ?? $chatId;
+
         $this->telegramRequest('approveChatJoinRequest', [
-            'chat_id' => '-1002013150763',
-            'user_id' => $this->callbackQuery->from()->id(),
+            'chat_id' => $chatId,
+            'user_id' => $userId,
         ]);
 
         $this->reply('Готово ✅');
